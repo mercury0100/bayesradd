@@ -1,0 +1,242 @@
+import math
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+from noise_lib import Noise             # for typing
+from losses import get_loss_fn as _get_loss_fn
+from noise_lib import add_noise_lambda
+
+def corrupt_and_denoise(model, noise, x):
+    B, T    = x.shape
+    device  = x.device
+    MASK_ID = model.config.tokens  # = vocab_size-1
+
+    # sample per-example time
+    t      = torch.rand(B, device=device)             
+    # 1) get total_noise σ(t)
+    sigma  = noise.total_noise(t)                     
+    # 2) convert to mask probability p = 1 - exp(-σ)
+    Lambda = (1 - torch.exp(-sigma)).clamp(0., 1.)     # [B]
+    # 3) mask via repo helper (correct mask token)
+    x_t    = add_noise_lambda(x, Lambda, MASK_ID)      # [B,T]
+    # 4) denoise
+    out    = model(x_t)
+    return out.logits if hasattr(out, "logits") else out
+
+
+# ——— 2.1) K‐sample ensemble statistics ————————————————
+def mc_marginal(model, noise, x: torch.LongTensor, K: int):
+    """
+    Monte‐Carlo marginal over K corrupt+denoise passes.
+    Returns:
+      mc_p  : [B, T, V_nonmask] renormalized over real vocab
+      mc_var: [B, T, V_nonmask]
+    """
+    B, T = x.shape
+    V     = model.config.tokens + 1
+    # accumulate full-vocab probs
+    sum_p  = torch.zeros(B, T, V, device=x.device)
+    sum_p2 = torch.zeros_like(sum_p)
+
+    for _ in range(K):
+        logits = corrupt_and_denoise(model, noise, x)    # [B,T,V]
+        p      = F.softmax(logits, dim=-1)               # [B,T,V]
+        sum_p  += p
+        sum_p2 += p * p
+
+    mc_p_full  = sum_p  / K                             # [B,T,V]
+    mc_var_full= sum_p2 / K - mc_p_full*mc_p_full       # [B,T,V]
+
+    # drop mask class, renormalize
+    mc_p  = mc_p_full[..., :-1]
+    mc_var= mc_var_full[..., :-1]
+    denom = mc_p.sum(dim=-1, keepdim=True)              # [B,T,1]
+    mc_p   = mc_p  / denom
+    mc_var = mc_var / denom**2                          # var[p/(∑p)] approx
+
+    return mc_p, mc_var
+
+
+# ——— 2.2) K‐sample tokenwise ensemble statistics ————————————————
+def mc_marginal_tokenwise(model, noise, x: torch.LongTensor, K: int):
+    """
+    Monte‐Carlo marginal *true‐token* probs and variance.
+    Returns:
+      mc_p_true : [B, T]
+      mc_var_true: [B, T]
+    """
+    B, T = x.shape
+    sum_p  = torch.zeros(B, T, device=x.device)
+    sum_p2 = torch.zeros_like(sum_p)
+
+    for _ in range(K):
+        logits = corrupt_and_denoise(model, noise, x)    # [B,T,V]
+        p      = F.softmax(logits, dim=-1)               # [B,T,V]
+        # drop mask & renormalize
+        p = p[..., :-1]
+        p = p / p.sum(dim=-1, keepdim=True)
+        # gather true-token prob
+        p_true = p.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # [B,T]
+        sum_p  += p_true
+        sum_p2 += p_true * p_true
+
+    mc_p_true  = sum_p  / K
+    mc_var_true= sum_p2 / K - mc_p_true*mc_p_true
+
+    return mc_p_true, mc_var_true
+
+
+# ——— 3) Perplexity from marginal probabilities —————————
+def compute_ppl_from_mc_p(mc_p: torch.Tensor, x: torch.LongTensor):
+    """
+    Given mc_p [B,T,V_nonmask] and x [B,T], returns PPL (scalar).
+    """
+    # true-token prob
+    p_true       = mc_p.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # [B,T]
+    logp_per_seq = p_true.clamp(min=1e-12).log().sum(dim=-1)     # [B]
+    avg_logp     = logp_per_seq.mean().item() / x.size(1)
+    return math.exp(-avg_logp)
+
+
+# ——— 4) Full MC‐marginal pass over dataset ————————
+@torch.no_grad()
+def mc_marginal_ppl(model, noise, device, dataloader, K,
+                    max_batches=None, tokenwise=False):
+    total_logp, total_count = 0.0, 0
+
+    length = min(max_batches, len(dataloader)) if max_batches else len(dataloader)
+    for i, batch in enumerate(tqdm(dataloader, total=length, desc=f"PPL K={K}")):
+        if max_batches is not None and i >= max_batches:
+            break
+
+        x = batch["input_ids"].to(device)
+        B, T = x.shape
+
+        if tokenwise:
+            p_true, _ = mc_marginal_tokenwise(model, noise, x, K)  # [B,T]
+            p_true    = p_true.clamp(min=1e-12)
+            total_logp   += p_true.log().sum().item()
+            total_count += B * T
+        else:
+            mc_p, _     = mc_marginal(model, noise, x, K)  # [B,T,V']
+            batch_ppl   = compute_ppl_from_mc_p(mc_p, x)
+            total_logp += math.log(batch_ppl)
+            total_count += 1
+
+    if total_count == 0:
+        raise ValueError("mc_marginal_ppl: no batches processed")
+
+    if tokenwise:
+        return math.exp(-total_logp / total_count)
+    else:
+        return math.exp(total_logp / total_count)
+
+
+# ——— 5) Baseline pass over dataset ————————
+@torch.no_grad()
+def baseline_ppl(model, noise, device, dataloader,
+                 max_batches=None, sequence_length=1024):
+    base_loss_fn = _get_loss_fn(noise,
+                                model.config.tokens+1,
+                                train=False,
+                                loss_type="lambda_DCE")
+    total_nll, total_batches = 0.0, 0
+    steps = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
+    for i, batch in enumerate(tqdm(dataloader, total=steps, desc="Baseline PPL")):
+        if max_batches is not None and i >= max_batches:
+            break
+        x = batch["input_ids"].to(device)
+        nll_batch = base_loss_fn(model, x)
+        if nll_batch.ndim > 0:
+            nll_batch = nll_batch.mean()
+        total_nll    += (nll_batch / sequence_length).item()
+        total_batches += 1
+
+    avg_nll = total_nll / total_batches
+    return math.exp(avg_nll)
+
+
+# ——— 6) Calibration pass over dataset ————————
+@torch.no_grad()
+def calibration_curve(model, noise, device, dataloader, K, n_bins=15, max_batches=None):
+    all_conf, all_corr = [], []
+
+    length = min(max_batches, len(dataloader)) if max_batches else len(dataloader)
+    for i, batch in enumerate(tqdm(dataloader, total=length, desc=f"Calib K={K}")):
+        if max_batches and i >= max_batches:
+            break
+        x = batch["input_ids"].to(device)   # [B,T]
+        mc_p, _   = mc_marginal(model, noise, x, K)  # [B,T,V']
+        p_conf, p_pred = mc_p.max(dim=-1)            # over V'
+        corr = (p_pred == x).float()                 # [B,T]
+
+        all_conf.append(p_conf.view(-1).cpu().numpy())
+        all_corr.append(corr.view(-1).cpu().numpy())
+
+    conf = np.concatenate(all_conf)
+    corr = np.concatenate(all_corr)
+    bins = np.linspace(0,1,n_bins+1)
+    centers = (bins[:-1]+bins[1:])/2
+    accuracies = np.zeros(n_bins)
+    confidences= np.zeros(n_bins)
+    counts     = np.zeros(n_bins)
+    N = conf.shape[0]
+
+    for b in range(n_bins):
+        # include rightmost edge in last bin
+        if b == n_bins-1:
+            mask = (conf>=bins[b]) & (conf<=bins[b+1])
+        else:
+            mask = (conf>=bins[b]) & (conf< bins[b+1])
+        counts[b] = mask.sum()
+        if counts[b]>0:
+            accuracies[b]   = corr[mask].mean()
+            confidences[b]  = conf[mask].mean()
+
+    ece = np.sum((counts/N) * np.abs(accuracies - confidences))
+    return centers, accuracies, confidences, counts, ece
+
+
+# ——— 7) OOD detection ————————
+@torch.no_grad()
+def ood_scores(model, noise, device, dataloader, K, max_batches=None, tokenizer=None):
+    """
+    Compute an OOD‐score per sequence as the average token‐variance.
+    If your dataloader yields dicts with "input_ids", those are used;
+    otherwise, if it yields raw text lines, you must pass in the tokenizer.
+    Returns:
+      seq_ids: list of (batch_idx, seq_idx)
+      scores:  list of floats
+    """
+    if tokenizer is None and not isinstance(next(iter(dataloader)), dict):
+        raise ValueError("For raw‐text OOD loader, you must pass `tokenizer=`")
+
+    seq_ids, scores = [], []
+    length = min(max_batches, len(dataloader)) if max_batches else len(dataloader)
+
+    for batch_idx, batch in enumerate(tqdm(dataloader, total=length, desc=f"OOD K={K}")):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+        # 1) get token‐ids
+        if isinstance(batch, dict):
+            x = batch["input_ids"].to(device)          # [B,T]
+        else:
+            # batch is e.g. a list of raw strings
+            enc = tokenizer(batch,
+                             padding="longest",
+                             truncation=True,
+                             max_length=model.config.model.length,
+                             return_tensors="pt")
+            x = enc["input_ids"].to(device)            # [B,T]
+
+        # 2) MC‐tokenwise variance
+        _, mc_var_true = mc_marginal_tokenwise(model, noise, x, K)  # [B,T]
+        seq_scores = mc_var_true.mean(dim=-1).cpu().tolist()       # [B]
+        for seq_idx, s in enumerate(seq_scores):
+            seq_ids.append((batch_idx, seq_idx))
+            scores.append(s)
+
+    return seq_ids, scores

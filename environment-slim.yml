@@ -1,0 +1,13 @@
+name: radd-infer
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.0.1         # CPU‐only build
+  - torchvision=0.15.2    # CPU‐only
+  - torchaudio=2.0.2      # CPU‐only
+  - pip
+  - pip:
+    - transformers>=4.0.0
+    - sentencepiece         # if your tokenizer needs it
