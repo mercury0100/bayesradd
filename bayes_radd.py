@@ -1,13 +1,14 @@
 import math
 import numpy as np
+from scipy.stats import norm
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from noise_lib import Noise             # for typing
 from losses import get_loss_fn as _get_loss_fn
-from noise_lib import add_noise_lambda
+from noise_lib import add_noise_lambda, Noise
 
+# ——— 1) It's a corruption ting ————————————————
 def corrupt_and_denoise(model, noise, x):
     B, T    = x.shape
     device  = x.device
@@ -86,6 +87,40 @@ def mc_marginal_tokenwise(model, noise, x: torch.LongTensor, K: int):
     mc_var_true= sum_p2 / K - mc_p_true*mc_p_true
 
     return mc_p_true, mc_var_true
+
+# —————————————————————————————————————————————————
+#  New: MC Mutual Information
+# —————————————————————————————————————————————————
+@torch.no_grad()
+def mc_mutual_information(model, noise, x: torch.LongTensor, K: int):
+    """
+    Returns
+      MI_tok : [B, T] mutual information per token
+      MI_seq : [B]   mean over tokens → one score per sequence
+    """
+    B, T = x.shape
+    V    = model.config.tokens + 1
+
+    # accumulate per‐sample probabilities and entropies
+    probs = []
+    H_per_sample = torch.zeros(B, T, device=x.device)
+    for _ in range(K):
+        logits = corrupt_and_denoise(model, noise, x)  # [B,T,V]
+        p      = F.softmax(logits, dim=-1)             # [B,T,V]
+        probs.append(p.unsqueeze(0))
+        H_per_sample += -(p * p.clamp(min=1e-12).log()).sum(-1)
+
+    probs = torch.cat(probs, dim=0)                   # [K, B, T, V]
+    p_bar = probs.mean(0)                             # [B, T, V]
+
+    # entropy of the mean
+    H_bar = -(p_bar * p_bar.clamp(min=1e-12).log()).sum(-1)  # [B, T]
+    H_exp = H_per_sample / K                              # [B, T]
+
+    MI_tok = H_bar - H_exp                                # [B, T]
+    MI_seq = MI_tok.mean(-1)                             # [B]
+
+    return MI_tok, MI_seq
 
 
 # ——— 3) Perplexity from marginal probabilities —————————
@@ -197,46 +232,3 @@ def calibration_curve(model, noise, device, dataloader, K, n_bins=15, max_batche
 
     ece = np.sum((counts/N) * np.abs(accuracies - confidences))
     return centers, accuracies, confidences, counts, ece
-
-
-# ——— 7) OOD detection ————————
-@torch.no_grad()
-def ood_scores(model, noise, device, dataloader, K, max_batches=None, tokenizer=None):
-    """
-    Compute an OOD‐score per sequence as the average token‐variance.
-    If your dataloader yields dicts with "input_ids", those are used;
-    otherwise, if it yields raw text lines, you must pass in the tokenizer.
-    Returns:
-      seq_ids: list of (batch_idx, seq_idx)
-      scores:  list of floats
-    """
-    if tokenizer is None and not isinstance(next(iter(dataloader)), dict):
-        raise ValueError("For raw‐text OOD loader, you must pass `tokenizer=`")
-
-    seq_ids, scores = [], []
-    length = min(max_batches, len(dataloader)) if max_batches else len(dataloader)
-
-    for batch_idx, batch in enumerate(tqdm(dataloader, total=length, desc=f"OOD K={K}")):
-        if max_batches is not None and batch_idx >= max_batches:
-            break
-
-        # 1) get token‐ids
-        if isinstance(batch, dict):
-            x = batch["input_ids"].to(device)          # [B,T]
-        else:
-            # batch is e.g. a list of raw strings
-            enc = tokenizer(batch,
-                             padding="longest",
-                             truncation=True,
-                             max_length=model.config.model.length,
-                             return_tensors="pt")
-            x = enc["input_ids"].to(device)            # [B,T]
-
-        # 2) MC‐tokenwise variance
-        _, mc_var_true = mc_marginal_tokenwise(model, noise, x, K)  # [B,T]
-        seq_scores = mc_var_true.mean(dim=-1).cpu().tolist()       # [B]
-        for seq_idx, s in enumerate(seq_scores):
-            seq_ids.append((batch_idx, seq_idx))
-            scores.append(s)
-
-    return seq_ids, scores

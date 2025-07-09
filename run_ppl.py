@@ -2,8 +2,9 @@ import torch
 import argparse
 import matplotlib.pyplot as plt
 from load_model import load_model
-from bayesRADD import mc_marginal_ppl
+from bayes_radd import mc_marginal_ppl
 import data
+
 import os
 import json
 
@@ -13,7 +14,7 @@ torch.manual_seed(42)
 MODEL_PATH = "JingyangOu/radd-t-dce"
 SEQ_LEN    = 1024
 BATCH_SIZE = 16
-MAX_BATCHES = 50
+MAX_BATCHES = 1
 K_LIST     = [1, 2, 3, 4, 8, 16, 24, 32]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
