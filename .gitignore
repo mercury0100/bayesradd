@@ -19,7 +19,6 @@ assets/
 core
 **.log
 *.jsonl
-*.ipynb
 *logs
 nohup.out
 datas
