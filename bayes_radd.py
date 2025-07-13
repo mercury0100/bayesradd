@@ -5,189 +5,236 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from losses import get_loss_fn as _get_loss_fn
+from losses import get_loss_fn
 from noise_lib import add_noise_lambda, Noise
 
 # ——— 1) It's a corruption ting ————————————————
-def corrupt_and_denoise(model, noise, x):
-    B, T    = x.shape
-    device  = x.device
-    MASK_ID = model.config.tokens  # = vocab_size-1
-
-    # sample per-example time
-    t      = torch.rand(B, device=device)             
-    # 1) get total_noise σ(t)
-    sigma  = noise.total_noise(t)                     
-    # 2) convert to mask probability p = 1 - exp(-σ)
-    Lambda = (1 - torch.exp(-sigma)).clamp(0., 1.)     # [B]
-    # 3) mask via repo helper (correct mask token)
-    x_t    = add_noise_lambda(x, Lambda, MASK_ID)      # [B,T]
-    # 4) denoise
-    out    = model(x_t)
-    return out.logits if hasattr(out, "logits") else out
-
-
-# ——— 2.1) K‐sample ensemble statistics ————————————————
-def mc_marginal(model, noise, x: torch.LongTensor, K: int):
+def corrupt_with_mask(x: torch.LongTensor,
+                      Lambda: torch.Tensor,
+                      MASK_ID: int):
     """
-    Monte‐Carlo marginal over K corrupt+denoise passes.
+    Randomly mask each position in x with probability Lambda[b].
     Returns:
-      mc_p  : [B, T, V_nonmask] renormalized over real vocab
-      mc_var: [B, T, V_nonmask]
+      x_t  : [B,T] the corrupted inputs
+      mask : [B,T] bool mask (True = this position was masked)
     """
     B, T = x.shape
-    V     = model.config.tokens + 1
-    # accumulate full-vocab probs
+    # expand per-sample probability to per-token
+    probs = Lambda.unsqueeze(-1).expand(B, T)
+    mask  = torch.bernoulli(probs).bool()
+    x_t   = x.masked_fill(mask, MASK_ID)
+    return x_t, mask
+
+
+# ——— 1.1) Pure denoise (no masking inside) —————————————
+@torch.no_grad()
+def denoise(model, x_t: torch.LongTensor):
+    out = model(x_t)
+    return out.logits if hasattr(out, "logits") else out  # [B,T,V]
+
+
+# ——— 2.1) K‐sample ensemble statistics (mask-aware) ————————————————
+@torch.no_grad()
+def mc_marginal(model, noise, x: torch.LongTensor, K: int):
+    B, T = x.shape
+    V    = model.config.tokens + 1
     sum_p  = torch.zeros(B, T, V, device=x.device)
     sum_p2 = torch.zeros_like(sum_p)
+    sum_mask = torch.zeros(B, T, device=x.device, dtype=torch.float)
 
     for _ in range(K):
-        logits = corrupt_and_denoise(model, noise, x)    # [B,T,V]
-        p      = F.softmax(logits, dim=-1)               # [B,T,V]
-        sum_p  += p
-        sum_p2 += p * p
+        # 1) sample noise / Lambda
+        t      = torch.rand(B, device=x.device)
+        sigma  = noise.total_noise(t)
+        Lambda = (1 - torch.exp(-sigma)).clamp(0, 1)
 
-    mc_p_full  = sum_p  / K                             # [B,T,V]
-    mc_var_full= sum_p2 / K - mc_p_full*mc_p_full       # [B,T,V]
+        # 2) corrupt and track mask
+        x_t, mask = corrupt_with_mask(x, Lambda, model.config.tokens)
 
-    # drop mask class, renormalize
-    mc_p  = mc_p_full[..., :-1]
-    mc_var= mc_var_full[..., :-1]
-    denom = mc_p.sum(dim=-1, keepdim=True)              # [B,T,1]
-    mc_p   = mc_p  / denom
-    mc_var = mc_var / denom**2                          # var[p/(∑p)] approx
+        # 3) denoise
+        logits = denoise(model, x_t)      # [B,T,V]
+        p      = F.softmax(logits, dim=-1)  # [B,T,V]
+
+        # 4) accumulate only at masked positions
+        mask_f = mask.float().unsqueeze(-1)  # [B,T,1]
+        sum_p  += p * mask_f
+        sum_p2 += (p * p) * mask_f
+        sum_mask += mask_f.squeeze(-1)
+
+    # avoid division by zero
+    sum_mask = sum_mask.clamp(min=1e-6).unsqueeze(-1)  # [B,T,1]
+
+    mc_p_full   = sum_p  / sum_mask                   # [B,T,V]
+    mc_var_full = sum_p2 / sum_mask - mc_p_full**2    # [B,T,V]
+
+    # drop MASK class and renormalize
+    mc_p   = mc_p_full[..., :-1]
+    mc_var = mc_var_full[..., :-1]
+    denom  = mc_p.sum(dim=-1, keepdim=True)
+    mc_p   = mc_p   / denom
+    mc_var = mc_var / denom**2
 
     return mc_p, mc_var
 
 
-# ——— 2.2) K‐sample tokenwise ensemble statistics ————————————————
+# ——— 2.2) MC marginal of true-token (mask-aware) ————————
+@torch.no_grad()
 def mc_marginal_tokenwise(model, noise, x: torch.LongTensor, K: int):
-    """
-    Monte‐Carlo marginal *true‐token* probs and variance.
-    Returns:
-      mc_p_true : [B, T]
-      mc_var_true: [B, T]
-    """
     B, T = x.shape
     sum_p  = torch.zeros(B, T, device=x.device)
     sum_p2 = torch.zeros_like(sum_p)
+    sum_mask = torch.zeros_like(sum_p)
 
     for _ in range(K):
-        logits = corrupt_and_denoise(model, noise, x)    # [B,T,V]
-        p      = F.softmax(logits, dim=-1)               # [B,T,V]
-        # drop mask & renormalize
+        t      = torch.rand(B, device=x.device)
+        sigma  = noise.total_noise(t)
+        Lambda = (1 - torch.exp(-sigma)).clamp(0, 1)
+
+        x_t, mask = corrupt_with_mask(x, Lambda, model.config.tokens)
+
+        logits = denoise(model, x_t)       # [B,T,V]
+        p      = F.softmax(logits, dim=-1) # [B,T,V]
+
+        # drop MASK class & renormalize per position
         p = p[..., :-1]
         p = p / p.sum(dim=-1, keepdim=True)
-        # gather true-token prob
-        p_true = p.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # [B,T]
-        sum_p  += p_true
-        sum_p2 += p_true * p_true
 
-    mc_p_true  = sum_p  / K
-    mc_var_true= sum_p2 / K - mc_p_true*mc_p_true
+        # gather true-token prob, only where mask=True
+        p_true = p.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # [B,T]
+        sum_p  += p_true * mask.float()
+        sum_p2 += (p_true**2) * mask.float()
+        sum_mask += mask.float()
+
+    # prevent zero-mask
+    sum_mask = sum_mask.clamp(min=1e-6)
+
+    mc_p_true   = sum_p  / sum_mask
+    mc_var_true = sum_p2 / sum_mask - mc_p_true**2
 
     return mc_p_true, mc_var_true
 
-# —————————————————————————————————————————————————
-#  New: MC Mutual Information
-# —————————————————————————————————————————————————
+# ——— 3) Baseline pass over dataset ————————
 @torch.no_grad()
-def mc_mutual_information(model, noise, x: torch.LongTensor, K: int):
+def zero_shot_ppl(model, noise, device, dataloader,
+            max_batches=None, sequence_length=1024):
     """
-    Returns
-      MI_tok : [B, T] mutual information per token
-      MI_seq : [B]   mean over tokens → one score per sequence
+    Computes PPL by exponentiating the Denoising Cross-Entropy (DCE) loss:
+      - This is the single-pass, analytic marginal likelihood under the diffusion model.
+      - Matches the RADD paper’s zero-shot PPL in Table 2.
+    Args:
+      model           : your BayesRADD / diffusion model
+      noise           : the noise schedule object
+      device          : torch device (“cuda” / “cpu”)
+      dataloader      : yields batches with batch["input_ids"] of shape [B, T]
+      max_batches     : optional int to limit how many batches to process
+      sequence_length : int, length T to normalize per-sequence loss
+    Returns:
+      ppl (float)
     """
-    B, T = x.shape
-    V    = model.config.tokens + 1
+    # build the DCE loss function
+    # vocab_size = model.config.tokens+1  (includes the MASK class)
+    base_loss_fn = get_loss_fn(
+        noise,
+        model.config.tokens + 1,
+        train=False,
+        loss_type="lambda_DCE"
+    )
 
-    # accumulate per‐sample probabilities and entropies
-    probs = []
-    H_per_sample = torch.zeros(B, T, device=x.device)
-    for _ in range(K):
-        logits = corrupt_and_denoise(model, noise, x)  # [B,T,V]
-        p      = F.softmax(logits, dim=-1)             # [B,T,V]
-        probs.append(p.unsqueeze(0))
-        H_per_sample += -(p * p.clamp(min=1e-12).log()).sum(-1)
-
-    probs = torch.cat(probs, dim=0)                   # [K, B, T, V]
-    p_bar = probs.mean(0)                             # [B, T, V]
-
-    # entropy of the mean
-    H_bar = -(p_bar * p_bar.clamp(min=1e-12).log()).sum(-1)  # [B, T]
-    H_exp = H_per_sample / K                              # [B, T]
-
-    MI_tok = H_bar - H_exp                                # [B, T]
-    MI_seq = MI_tok.mean(-1)                             # [B]
-
-    return MI_tok, MI_seq
-
-
-# ——— 3) Perplexity from marginal probabilities —————————
-def compute_ppl_from_mc_p(mc_p: torch.Tensor, x: torch.LongTensor):
-    """
-    Given mc_p [B,T,V_nonmask] and x [B,T], returns PPL (scalar).
-    """
-    # true-token prob
-    p_true       = mc_p.gather(-1, x.unsqueeze(-1)).squeeze(-1)  # [B,T]
-    logp_per_seq = p_true.clamp(min=1e-12).log().sum(dim=-1)     # [B]
-    avg_logp     = logp_per_seq.mean().item() / x.size(1)
-    return math.exp(-avg_logp)
-
-
-# ——— 4) Full MC‐marginal pass over dataset ————————
-@torch.no_grad()
-def mc_marginal_ppl(model, noise, device, dataloader, K,
-                    max_batches=None, tokenwise=False):
-    total_logp, total_count = 0.0, 0
-
-    length = min(max_batches, len(dataloader)) if max_batches else len(dataloader)
-    for i, batch in enumerate(tqdm(dataloader, total=length, desc=f"PPL K={K}")):
-        if max_batches is not None and i >= max_batches:
-            break
-
-        x = batch["input_ids"].to(device)
-        B, T = x.shape
-
-        if tokenwise:
-            p_true, _ = mc_marginal_tokenwise(model, noise, x, K)  # [B,T]
-            p_true    = p_true.clamp(min=1e-12)
-            total_logp   += p_true.log().sum().item()
-            total_count += B * T
-        else:
-            mc_p, _     = mc_marginal(model, noise, x, K)  # [B,T,V']
-            batch_ppl   = compute_ppl_from_mc_p(mc_p, x)
-            total_logp += math.log(batch_ppl)
-            total_count += 1
-
-    if total_count == 0:
-        raise ValueError("mc_marginal_ppl: no batches processed")
-
-    if tokenwise:
-        return math.exp(-total_logp / total_count)
-    else:
-        return math.exp(total_logp / total_count)
-
-
-# ——— 5) Baseline pass over dataset ————————
-@torch.no_grad()
-def baseline_ppl(model, noise, device, dataloader,
-                 max_batches=None, sequence_length=1024):
-    base_loss_fn = _get_loss_fn(noise,
-                                model.config.tokens+1,
-                                train=False,
-                                loss_type="lambda_DCE")
     total_nll, total_batches = 0.0, 0
     steps = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
-    for i, batch in enumerate(tqdm(dataloader, total=steps, desc="Baseline PPL")):
+
+    for i, batch in enumerate(tqdm(dataloader, total=steps, desc="DCE PPL")):
         if max_batches is not None and i >= max_batches:
             break
-        x = batch["input_ids"].to(device)
+
+        x = batch["input_ids"].to(device)  # [B, T]
+        # base_loss_fn returns per-sequence NLL (averaged over tokens if T>1)
         nll_batch = base_loss_fn(model, x)
+
+        # if it returns a vector, take its mean
         if nll_batch.ndim > 0:
             nll_batch = nll_batch.mean()
+
+        # convert per-sequence loss to per-token, then sum across batches
         total_nll    += (nll_batch / sequence_length).item()
         total_batches += 1
 
+    if total_batches == 0:
+        raise ValueError("dce_ppl: no batches processed")
+
     avg_nll = total_nll / total_batches
     return math.exp(avg_nll)
+
+@torch.no_grad()
+def zero_shot_mc_ppl(model,
+                              noise,
+                              device,
+                              dataloader,
+                              K: int,
+                              mask_rate: float,
+                              max_batches: int = None,
+                              sequence_length: int = 1024):
+    """
+    Zero‐shot PPL with both:
+      1) Outer diffusion‐schedule masking (via add_noise_lambda)
+      2) Inner fixed‐rate Bernoulli masking over the remaining tokens
+    
+    Args:
+      model           : BayesRADD denoiser
+      noise           : diffusion noise schedule
+      device          : torch.device
+      dataloader      : yields batch["input_ids"] of shape [B, T]
+      K               : number of MC samples
+      mask_rate       : float in [0,1], inner‐mask rate
+      max_batches     : cap on number of batches (for quick tests)
+      sequence_length : length T for per‐token normalization
+    Returns:
+      ppl (float)
+    """
+    model.eval()
+    MASK_ID = model.config.tokens
+    total_logp, total_count = 0.0, 0
+
+    steps = len(dataloader) if max_batches is None else min(len(dataloader), max_batches)
+    for i, batch in enumerate(tqdm(dataloader, total=steps, desc="MC double‐mask PPL")):
+        if max_batches is not None and i >= max_batches:
+            break
+
+        # [B, T] token IDs
+        x = torch.stack([torch.tensor(seq, device=device) for seq in batch["input_ids"]], dim=0)
+        B, T = x.shape
+
+        # accumulate sum of true‐token probs over K
+        sum_p = torch.zeros(B, T, device=device)
+
+        for _ in range(K):
+            # 1) outer schedule mask
+            t0      = torch.rand(B, device=device)
+            sigma0  = noise.total_noise(t0)
+            Λ0      = (1 - torch.exp(-sigma0)).clamp(0.,1.)    # [B]
+            x0      = add_noise_lambda(x, Λ0, MASK_ID)        # [B, T]
+
+            # 2) inner fixed‐rate mask on unmasked slots
+            valid    = (x0 != MASK_ID)                       # [B, T]
+            rand_m   = torch.rand(B, T, device=device) < mask_rate
+            inner_m  = rand_m & valid                        # [B, T]
+            xk       = x0.masked_fill(inner_m, MASK_ID)      # [B, T]
+
+            # 3) denoise and get true‐token probs
+            out    = model(xk)
+            logits = out.logits if hasattr(out, "logits") else out  # [B, T, V]
+            p_all  = F.softmax(logits, dim=-1)                       # [B, T, V]
+            p_true = p_all.gather(-1, x.unsqueeze(-1)).squeeze(-1)   # [B, T]
+
+            # 4) only score the *outer* masked positions
+            outer_m = (x0 == MASK_ID).float()                       # [B, T]
+            sum_p  += p_true * outer_m
+
+        # 5) average over K and accumulate log‐probs
+        p_hat   = (sum_p / K).clamp(min=1e-12)                     # [B, T]
+        # sum log‐prob *once* per masked token
+        total_logp  += (p_hat.log() * (x0==MASK_ID).float()).sum().item()
+        total_count += (x0==MASK_ID).float().sum().item()
+
+    avg_logp = total_logp / total_count
+    return math.exp(-avg_logp)
